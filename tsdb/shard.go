@@ -542,6 +542,12 @@ func (s *Shard) DeleteMeasurement(name []byte) error {
 
 // SeriesN returns the unique number of series in the shard.
 func (s *Shard) SeriesN() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := s.ready(); err != nil {
+		return 0
+	}
+
 	return s.engine.SeriesN()
 }
 
@@ -549,7 +555,7 @@ func (s *Shard) SeriesN() int64 {
 func (s *Shard) SeriesSketches() (estimator.Sketch, estimator.Sketch, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.engine == nil {
+	if s.ready() != nil {
 		return nil, nil, nil
 	}
 	return s.engine.SeriesSketches()
@@ -559,7 +565,7 @@ func (s *Shard) SeriesSketches() (estimator.Sketch, estimator.Sketch, error) {
 func (s *Shard) MeasurementsSketches() (estimator.Sketch, estimator.Sketch, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.engine == nil {
+	if s.ready() != nil {
 		return nil, nil, nil
 	}
 	return s.engine.MeasurementsSketches()
@@ -815,16 +821,17 @@ func (s *Shard) WriteTo(w io.Writer) (int64, error) {
 
 // CreateIterator returns an iterator for the data in the shard.
 func (s *Shard) CreateIterator(measurement string, opt query.IteratorOptions) (query.Iterator, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+
 	if strings.HasPrefix(measurement, "_") {
 		if itr, ok, err := s.createSystemIterator(measurement, opt); ok {
 			return itr, err
 		}
 		// Unknown system source so pass this to the engine.
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if err := s.ready(); err != nil {
-		return nil, err
 	}
 	return s.engine.CreateIterator(measurement, opt)
 }
@@ -866,16 +873,6 @@ func (s *Shard) createSeriesIterator(opt query.IteratorOptions) (query.Iterator,
 	}
 
 	return s.engine.SeriesPointIterator(opt)
-}
-
-// IteratorCost returns the estimated cost of constructing and reading an iterator.
-func (s *Shard) IteratorCost(measurement string, opt query.IteratorOptions) (query.IteratorCost, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if err := s.ready(); err != nil {
-		return query.IteratorCost{}, err
-	}
-	return s.engine.IteratorCost(measurement, opt)
 }
 
 // FieldDimensions returns unique sets of fields and dimensions across a list of sources.
@@ -941,7 +938,7 @@ func (s *Shard) FieldDimensions(measurements []string) (fields map[string]influx
 	return fields, dimensions, nil
 }
 
-func (s *Shard) MeasurementsByRegex(re *regexp.Regexp) []string {
+func (s *Shard) measurementsByRegex(re *regexp.Regexp) []string {
 	a, _ := s.engine.MeasurementNamesByRegex(re)
 
 	other := make([]string, len(a))
@@ -951,8 +948,8 @@ func (s *Shard) MeasurementsByRegex(re *regexp.Regexp) []string {
 	return other
 }
 
-// MapType returns the data type for the field within the measurement.
-func (s *Shard) MapType(measurement, field string) influxql.DataType {
+// mapType returns the data type for the field within the measurement.
+func (s *Shard) mapType(measurement, field string) influxql.DataType {
 	switch field {
 	case "_name", "_tagKey", "_tagValue", "_seriesKey":
 		return influxql.String
@@ -999,9 +996,9 @@ func (s *Shard) MapType(measurement, field string) influxql.DataType {
 	return influxql.Unknown
 }
 
-// ExpandSources expands regex sources and removes duplicates.
+// expandSources expands regex sources and removes duplicates.
 // NOTE: sources must be normalized (db and rp set) before calling this function.
-func (s *Shard) ExpandSources(sources influxql.Sources) (influxql.Sources, error) {
+func (s *Shard) expandSources(sources influxql.Sources) (influxql.Sources, error) {
 	// Use a map as a set to prevent duplicates.
 	set := map[string]influxql.Source{}
 
@@ -1110,7 +1107,7 @@ func (s *Shard) ForEachMeasurementName(fn func(name []byte) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := s.ready(); err != nil {
-		return nil
+		return err
 	}
 	return s.engine.ForEachMeasurementName(fn)
 }
@@ -1119,7 +1116,7 @@ func (s *Shard) ForEachMeasurementTagKey(name []byte, fn func(key []byte) error)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := s.ready(); err != nil {
-		return nil
+		return err
 	}
 
 	return s.engine.ForEachMeasurementTagKey(name, fn)
@@ -1156,13 +1153,19 @@ func (a Shards) Less(i, j int) bool { return a[i].id < a[j].id }
 // Swap implements sort.Interface.
 func (a Shards) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
+// MeasurementsByRegex returns the unique set of measurements matching the
+// provided regex, for all the shards.
 func (a Shards) MeasurementsByRegex(re *regexp.Regexp) []string {
 	m := make(map[string]struct{})
 	for _, sh := range a {
-		names := sh.MeasurementsByRegex(re)
-		for _, name := range names {
-			m[name] = struct{}{}
+		sh.mu.RLock()
+		if err := sh.ready(); err == nil {
+			names := sh.measurementsByRegex(re)
+			for _, name := range names {
+				m[name] = struct{}{}
+			}
 		}
+		sh.mu.RUnlock()
 	}
 
 	if len(m) == 0 {
@@ -1201,9 +1204,13 @@ func (a Shards) FieldDimensions(measurements []string) (fields map[string]influx
 func (a Shards) MapType(measurement, field string) influxql.DataType {
 	var typ influxql.DataType
 	for _, sh := range a {
-		if t := sh.MapType(measurement, field); typ.LessThan(t) {
-			typ = t
+		sh.mu.RLock()
+		if err := sh.ready(); err == nil {
+			if t := sh.mapType(measurement, field); typ.LessThan(t) {
+				typ = t
+			}
 		}
+		defer sh.mu.RUnlock()
 	}
 	return typ
 }
@@ -1244,6 +1251,14 @@ func (a Shards) IteratorCost(measurement string, opt query.IteratorOptions) (que
 	var costerr error
 	var mu sync.RWMutex
 
+	setErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if costerr == nil {
+			costerr = err
+		}
+	}
+
 	limit := limiter.NewFixed(runtime.GOMAXPROCS(0))
 	var wg sync.WaitGroup
 	for _, sh := range a {
@@ -1261,18 +1276,23 @@ func (a Shards) IteratorCost(measurement string, opt query.IteratorOptions) (que
 			defer limit.Release()
 			defer wg.Done()
 
-			cost, err := sh.IteratorCost(measurement, opt)
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			if err != nil {
-				if costerr == nil {
-					costerr = err
-				}
+			sh.mu.RLock()
+			if err := sh.ready(); err != nil {
+				sh.mu.RUnlock()
+				setErr(err)
 				return
 			}
+			cost, err := sh.engine.IteratorCost(measurement, opt)
+			sh.mu.RUnlock()
+
+			if err != nil {
+				setErr(err)
+				return
+			}
+
+			mu.Lock()
 			costs = costs.Combine(cost)
+			mu.Unlock()
 		}(sh)
 	}
 	wg.Wait()
@@ -1285,7 +1305,13 @@ func (a Shards) ExpandSources(sources influxql.Sources) (influxql.Sources, error
 
 	// Iterate through every shard and expand the sources.
 	for _, sh := range a {
-		expanded, err := sh.ExpandSources(sources)
+		sh.mu.RLock()
+		if err := sh.ready(); err != nil {
+			return nil, err
+		}
+		expanded, err := sh.expandSources(sources)
+		sh.mu.RUnlock()
+
 		if err != nil {
 			return nil, err
 		}
